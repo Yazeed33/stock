@@ -1,0 +1,158 @@
+"""
+ماسح السيولة العالية - Unusual Volume / Liquidity Scanner
+------------------------------------------------------------
+يفرز الأسهم الأمريكية التي دخل عليها حجم تداول (سيولة) أعلى من معدلها
+الطبيعي بشكل ملحوظ، ليساعدك على اللحاق بحركات المضاربة السريعة.
+
+طريقة التشغيل:
+    1) pip install streamlit yfinance pandas numpy
+    2) streamlit run liquidity_scanner.py
+"""
+
+import streamlit as st
+import yfinance as yf
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import concurrent.futures
+
+st.set_page_config(page_title="ماسح السيولة العالية", layout="wide", page_icon="📈")
+
+# ---------------------------------------------------------------
+# قوائم أسهم افتراضية (يمكن للمستخدم تعديلها أو رفع قائمته الخاصة)
+# ---------------------------------------------------------------
+DEFAULT_UNIVERSE = {
+    "S&P 500 (عينة نشطة)": [
+        "AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","AMD","AVGO","NFLX",
+        "JPM","BAC","XOM","CVX","PLTR","SOFI","F","T","INTC","PFE",
+        "COIN","MARA","RIOT","GME","AMC","NIO","LCID","RIVN","SNAP","UBER",
+        "BA","DIS","KO","PEP","WMT","CRM","ORCL","ADBE","QCOM","MU",
+        "SMCI","ARM","DELL","C","WFC","GS","MS","V","MA","PYPL",
+    ],
+    "أسهم شبابية / ميمز (تقلب عالٍ)": [
+        "GME","AMC","BBBY","BBIG","MULN","SIRI","NKLA","WKHS","SPCE","PLUG",
+        "FCEL","CLOV","SOFI","PLTR","LCID","RIVN","VFS","FFIE","BGFV","CVNA",
+    ],
+}
+
+# ---------------------------------------------------------------
+# دوال الجلب والتحليل
+# ---------------------------------------------------------------
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_ticker_data(ticker: str, avg_days: int = 20):
+    """يجلب بيانات يومية حديثة لسهم ويحسب مقاييس السيولة."""
+    try:
+        t = yf.Ticker(ticker)
+        hist = t.history(period=f"{avg_days + 5}d", interval="1d")
+        if hist.empty or len(hist) < 2:
+            return None
+
+        hist = hist.dropna()
+        last_row = hist.iloc[-1]
+        prev_close = hist.iloc[-2]["Close"]
+
+        avg_volume = hist["Volume"].iloc[:-1].tail(avg_days).mean()
+        today_volume = last_row["Volume"]
+        volume_ratio = (today_volume / avg_volume) if avg_volume > 0 else 0
+
+        price_change_pct = ((last_row["Close"] - prev_close) / prev_close) * 100
+        dollar_volume = today_volume * last_row["Close"]
+
+        return {
+            "الرمز": ticker,
+            "السعر": round(last_row["Close"], 2),
+            "التغير %": round(price_change_pct, 2),
+            "حجم اليوم": int(today_volume),
+            "متوسط الحجم": int(avg_volume) if not np.isnan(avg_volume) else 0,
+            "نسبة السيولة (×)": round(volume_ratio, 2),
+            "قيمة التداول $": int(dollar_volume),
+        }
+    except Exception:
+        return None
+
+
+def scan_universe(tickers, avg_days, max_workers=10):
+    results = []
+    progress = st.progress(0, text="جاري فحص الأسهم...")
+    total = len(tickers)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(fetch_ticker_data, tk, avg_days): tk for tk in tickers}
+        done = 0
+        for f in concurrent.futures.as_completed(futures):
+            data = f.result()
+            if data:
+                results.append(data)
+            done += 1
+            progress.progress(done / total, text=f"جاري فحص الأسهم... ({done}/{total})")
+    progress.empty()
+    return pd.DataFrame(results)
+
+
+# ---------------------------------------------------------------
+# الواجهة
+# ---------------------------------------------------------------
+st.title("📈 ماسح السيولة العالية غير الاعتيادية")
+st.caption("يكشف الأسهم التي دخل عليها حجم تداول أعلى من معدلها الطبيعي — إشارة مبكرة على اهتمام مضاربي.")
+
+with st.sidebar:
+    st.header("⚙️ الإعدادات")
+
+    universe_choice = st.selectbox("مجموعة الأسهم", list(DEFAULT_UNIVERSE.keys()) + ["قائمة مخصصة"])
+    if universe_choice == "قائمة مخصصة":
+        custom = st.text_area("أدخل الرموز مفصولة بفاصلة", "AAPL, TSLA, NVDA")
+        tickers = [x.strip().upper() for x in custom.split(",") if x.strip()]
+    else:
+        tickers = DEFAULT_UNIVERSE[universe_choice]
+
+    avg_days = st.slider("عدد أيام حساب متوسط الحجم", 5, 60, 20)
+    min_ratio = st.slider("الحد الأدنى لنسبة السيولة (× المعدل)", 1.0, 10.0, 2.0, step=0.5)
+    min_dollar_vol = st.number_input("أقل قيمة تداول بالدولار (لاستبعاد الأسهم الرخيصة/الوهمية)", value=1_000_000, step=500_000)
+    min_price = st.number_input("أقل سعر للسهم $", value=1.0, step=0.5)
+
+    run_scan = st.button("🔍 ابدأ الفحص", type="primary", use_container_width=True)
+
+if run_scan:
+    st.session_state["last_run"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with st.spinner("جاري تحميل البيانات..."):
+        df = scan_universe(tickers, avg_days)
+
+    if df.empty:
+        st.warning("لم يتم العثور على بيانات. تأكد من صحة الرموز أو حاول لاحقًا.")
+    else:
+        filtered = df[
+            (df["نسبة السيولة (×)"] >= min_ratio)
+            & (df["قيمة التداول $"] >= min_dollar_vol)
+            & (df["السعر"] >= min_price)
+        ].sort_values("نسبة السيولة (×)", ascending=False)
+
+        st.success(f"تم فحص {len(df)} سهم — {len(filtered)} سهم تجاوز الحد المحدد لنسبة السيولة.")
+
+        if filtered.empty:
+            st.info("لا توجد أسهم تحقق الشروط الحالية. جرّب تقليل الحد الأدنى لنسبة السيولة.")
+        else:
+            def highlight_change(val):
+                color = "#1e7d32" if val > 0 else ("#c62828" if val < 0 else "black")
+                return f"color: {color}; font-weight: bold"
+
+            st.dataframe(
+                filtered.style.applymap(highlight_change, subset=["التغير %"])
+                .format({
+                    "السعر": "${:.2f}",
+                    "التغير %": "{:+.2f}%",
+                    "حجم اليوم": "{:,}",
+                    "متوسط الحجم": "{:,}",
+                    "قيمة التداول $": "${:,.0f}",
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            st.caption(f"آخر تحديث: {st.session_state.get('last_run', '-')}")
+else:
+    st.info("اضبط الإعدادات من القائمة الجانبية ثم اضغط 'ابدأ الفحص'.")
+
+st.markdown("---")
+st.caption(
+    "⚠️ هذه الأداة لأغراض المعلومات فقط وليست توصية استثمارية. "
+    "المضاربة على الأسهم ذات السيولة المفاجئة تحمل مخاطر عالية جدًا — استخدم إدارة رأس مال صارمة."
+)
